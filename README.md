@@ -17,7 +17,7 @@ Transports: tcp/raw, ws, grpc, httpupgrade, xhttp. Security: none, tls, reality.
 
 Python 3.8+ and nothing else:
 
-    curl -o xlink https://raw.githubusercontent.com/USER/xlink/main/xlink.py
+    curl -o xlink https://raw.githubusercontent.com/hamidi2/xlink/main/xlink.py
     chmod +x xlink
 
 ## Client side
