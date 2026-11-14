@@ -21,6 +21,7 @@ Subscriptions (customer DB, kept apart from the xray config):
   xlink sub-disable  DB EMAIL                   switch a customer off (record kept)
   xlink sub-serve    DB CONFIG INBOUND --host H the subscription URL responder (local HTTP)
   xlink sub-list     DB                         usage, expiry and state per customer
+  xlink sub-migrate-v2 DB                      convert a schema-1 DB to volume mode
   xlink sub-setup    CONFIG --api ADDR          enable the xray API + per-user counters
   xlink sub-sync     DB CONFIG INBOUND --api ADDR [--loop]
                                                 count usage, cut off / revive users
@@ -462,19 +463,37 @@ def db_load(path):
         return {"schema": 1, "users": []}
     with open(path) as fh:
         db = json.load(fh)
-    if db.get("schema") != 1: die(f"{path}: unsupported schema {db.get('schema')!r}")
+    if db.get("schema") not in (1, 2): die(f"{path}: unsupported schema {db.get('schema')!r}")
     return db
+
+
+def is_volume(db):
+    """Schema 2 = volume billing: per-account balances, no expiry."""
+    return db.get("schema") == 2
+
+
+def account_used(db, username):
+    return sum(u["used_bytes"] for u in db["users"] if u.get("account") == username)
+
+
+def account_balance(db, u):
+    return db.get("balances", {}).get(u.get("account", ""), 0)
 
 
 def db_save(path, db):
     tmp = f"{path}.tmp"
     # Holds UUIDs and tokens: private by default; an existing file keeps its mode
-    # (e.g. 0640 so a non-root sub-serve can read it through its group).
-    mode = os.stat(path).st_mode & 0o777 if os.path.exists(path) else 0o600
+    # (e.g. 0640 so a non-root sub-serve can read it through its group) AND its
+    # owner, so a root sync never strips write access from the polsub API user.
+    st = os.stat(path) if os.path.exists(path) else None
+    mode = st.st_mode & 0o777 if st else 0o600
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps(db, indent=2, ensure_ascii=False) + "\n")
     os.chmod(tmp, mode)
+    if st:
+        try: os.chown(tmp, st.st_uid, st.st_gid)
+        except PermissionError: pass   # non-root keeps its own ownership
     os.replace(tmp, path)
 
 
@@ -498,8 +517,11 @@ def plan_expiry(plan):
     return time.strftime("%Y-%m-%d", time.gmtime(time.mktime((y, m, d + plan["days"], 12, 0, 0, 0, 0, -1))))
 
 
-def allowance(u):
-    """Bytes the user may use now: the plan's quota plus the prepaid reserve."""
+def allowance(u, db=None):
+    """Bytes the account may use now. Schema 1: plan quota + reserve.
+    Schema 2: the account's volume balance."""
+    if db is not None and is_volume(db):
+        return account_balance(db, u)
     return int(u["plans"][-1]["quota_gb"] * GB) + u.get("reserve_bytes", 0)
 
 
@@ -510,8 +532,12 @@ def order_owner(db, order):
     return None
 
 
-def user_state(u, today):
+def user_state(u, today, db=None):
     """ok | disabled | expired | over-quota (the reason a user should be off)."""
+    if db is not None and is_volume(db):
+        if not u["active"]: return "disabled"
+        return "ok" if account_used(db, u.get("account", "")) < account_balance(db, u) \
+            else "over-quota"
     if not u["plans"]: return "disabled"
     p = u["plans"][-1]
     if today >= plan_expiry(p): return "expired"
@@ -525,6 +551,8 @@ def db_grant(db, email, days, gb, today, create, order=None, note=None):
     Idempotent per ORDER: replaying the same order id (a retried payment
     webhook, a repeated manual command) changes nothing.
     """
+    if is_volume(db):
+        die("volume-mode DB (schema 2): accounts are managed by polapi, not sub-user-add/sub-renew")
     if days <= 0 or gb <= 0: die("--days and --gb must be positive")
     u = db_find(db, email)
     if order and order_owner(db, order):
@@ -550,9 +578,20 @@ def db_grant(db, email, days, gb, today, create, order=None, note=None):
 
 
 def db_topup(db, email, gb, today, order=None):
-    """Add GB to EMAIL's reserve: spent only after a plan's quota runs out,
-    and carried over renewals. Does not extend the expiry date."""
+    """Add GB to EMAIL's reserve (schema 1) or the account's balance (schema 2)."""
     if gb <= 0: die("--gb must be positive")
+    if is_volume(db):
+        u = db_find(db, email)
+        if u is None:
+            for cand in db["users"]:
+                if cand.get("account", "").startswith(email.split("#")[0] + "#"):
+                    u = cand
+                    break
+        if u is None: die(f"no user '{email}'")
+        acct = u.get("account", email.split("#")[0])
+        db["balances"] = db.get("balances", {})
+        db["balances"][acct] = db["balances"].get(acct, 0) + int(gb * GB)
+        return u, True
     u = db_find(db, email) or die(f"no user '{email}'")
     if order and order_owner(db, order):
         if order_owner(db, order) is not u: die(f"order '{order}' already belongs to another user")
@@ -607,16 +646,50 @@ def cmd_sub_grant(a):
 def cmd_sub_list(a):
     db = db_load(a.db)
     today = time.strftime("%Y-%m-%d")
-    rows = [("EMAIL", "USED/QUOTA GB", "RESERVE GB", "EXPIRES", "STATE", "NOTE")]
-    for u in db["users"]:
-        p = u["plans"][-1] if u["plans"] else None
-        rows.append((u["email"],
-                     f"{u['used_bytes'] / GB:.2f}/{p['quota_gb']:g}" if p else "-",
-                     f"{reserve_left(u) / GB:.2f}",
-                     plan_expiry(p) if p else "-", user_state(u, today), u.get("note", "")))
+    if is_volume(db):
+        rows = [("EMAIL", "ACCOUNT", "USED GB", "BALANCE GB", "STATE", "NOTE")]
+        for u in db["users"]:
+            rows.append((u["email"], u.get("account", ""),
+                         f"{u['used_bytes'] / GB:.2f}",
+                         f"{account_balance(db, u) / GB:.2f}",
+                         user_state(u, today, db), u.get("note", "")))
+    else:
+        rows = [("EMAIL", "USED/QUOTA GB", "RESERVE GB", "EXPIRES", "STATE", "NOTE")]
+        for u in db["users"]:
+            p = u["plans"][-1] if u["plans"] else None
+            rows.append((u["email"],
+                         f"{u['used_bytes'] / GB:.2f}/{p['quota_gb']:g}" if p else "-",
+                         f"{reserve_left(u) / GB:.2f}",
+                         plan_expiry(p) if p else "-", user_state(u, today), u.get("note", "")))
     w = [max(len(r[i]) for r in rows) for i in range(6)]
     for r in rows:
         print("  ".join(c.ljust(w[i]) for i, c in enumerate(r)).rstrip())
+
+
+def cmd_sub_migrate_v2(a):
+    """Convert a schema-1 users.json to volume mode (schema 2), in place.
+
+    Per-user remaining (plan + reserve - used) becomes the account's balance;
+    users sharing an email prefix (ali, ali#d2, ...) form one account."""
+    with db_lock(a.db):
+        db = db_load(a.db)
+        if is_volume(db):
+            die("already volume mode (schema 2)")
+        import shutil as _sh
+        _sh.copy2(a.db, f"{a.db}.pre-v2-{time.strftime('%Y%m%d-%H%M%S')}")
+        balances, users = {}, []
+        for u in db["users"]:
+            acct = u["email"].split("#")[0]
+            remaining = allowance(u) - u["used_bytes"]
+            balances[acct] = balances.get(acct, 0) + max(0, remaining)
+            nu = {k: u[k] for k in ("email", "uuid", "token", "created",
+                                    "used_bytes", "active", "note") if k in u}
+            nu["account"] = acct
+            users.append(nu)
+        db2 = {"schema": 2, "users": users, "balances": balances}
+        db_save(a.db, db2)
+    for acct, bal in balances.items():
+        print(f"account {acct}: balance {bal / GB:.2f} GB", file=sys.stderr)
 
 
 def xray_api(server, *args):
@@ -650,7 +723,7 @@ def sync_clients(ib, db, today, flow):
     inbound is left alone.
     """
     cl = ib["settings"].setdefault("clients", [])
-    want = {u["email"]: u for u in db["users"] if user_state(u, today) == "ok"}
+    want = {u["email"]: u for u in db["users"] if user_state(u, today, db) == "ok"}
     known = {u["email"] for u in db["users"]}
     removed = [c for c in cl if c.get("email") in known and c["email"] not in want]
     have = {c.get("email") for c in cl}
@@ -670,8 +743,12 @@ def next_interval(db, today, max_mbps, lo, hi):
     Assumes nobody moves data faster than MAX_MBPS, and polls at half the
     time the closest user would need to exhaust the quota at that speed.
     """
-    left = [allowance(u) - u["used_bytes"]
-            for u in db["users"] if user_state(u, today) == "ok"]
+    if is_volume(db):
+        left = [account_balance(db, u) - account_used(db, u.get("account", ""))
+                for u in db["users"] if user_state(u, today, db) == "ok"]
+    else:
+        left = [allowance(u) - u["used_bytes"]
+                for u in db["users"] if user_state(u, today, db) == "ok"]
     if not left: return hi
     return max(lo, min(hi, min(left) / (max_mbps * 125000) / 2))
 
@@ -724,7 +801,7 @@ def sub_sync_once(a):
         for c in added: print(f"enabled  {c['email']}", file=sys.stderr)
         for c in removed:
             u = db_find(db, c["email"])
-            print(f"disabled {c['email']} ({user_state(u, today)})", file=sys.stderr)
+            print(f"disabled {c['email']} ({user_state(u, today, db)})", file=sys.stderr)
     return db, today
 
 
@@ -776,13 +853,19 @@ def days_left(u, today):
     return (plan_expiry_epoch(u["plans"][-1]) - int(time.mktime((y, m, d, 0, 0, 0, 0, 0, -1)))) // 86400
 
 
-def sub_notices(u, today, warn_frac=0.1, warn_days=3):
+def sub_notices(u, today, db=None, warn_frac=0.1, warn_days=3):
     """Messages the customer should see in the app's server list."""
-    state = user_state(u, today)
+    state = user_state(u, today, db)
     if state == "expired": return ["EXPIRED - renew to reconnect"]
-    if state == "over-quota": return ["DATA FINISHED - renew to reconnect"]
+    if state == "over-quota": return ["DATA FINISHED - top up to reconnect"]
     if state == "disabled": return ["DISABLED"]
     out = []
+    if db is not None and is_volume(db):
+        left = account_balance(db, u) - account_used(db, u.get("account", ""))
+        if left <= 0: return out
+        if left <= account_balance(db, u) * warn_frac:
+            out.append(f"Only {left / GB:.1f} GB left - top up soon")
+        return out
     quota = int(u["plans"][-1]["quota_gb"] * GB)
     left = quota - u["used_bytes"]
     if left <= 0:
@@ -794,15 +877,16 @@ def sub_notices(u, today, warn_frac=0.1, warn_days=3):
     return out
 
 
-def sub_response(u, today, links):
+def sub_response(u, today, links, db=None):
     """(body, headers) for one customer. LINKS are the working share links."""
-    notices = sub_notices(u, today)
+    notices = sub_notices(u, today, db)
     lines = [notice_link(n) for n in notices]
-    if user_state(u, today) == "ok": lines += links
+    if user_state(u, today, db) == "ok": lines += links
+    expire = 0 if (db is not None and is_volume(db)) else plan_expiry_epoch(u["plans"][-1])
     headers = {
         "Content-Type": "text/plain; charset=utf-8",
-        "Subscription-Userinfo": (f"upload=0; download={u['used_bytes']}; total={allowance(u)}; "
-                                  f"expire={plan_expiry_epoch(u['plans'][-1])}"),
+        "Subscription-Userinfo": (f"upload=0; download={u['used_bytes']}; total={allowance(u, db)}; "
+                                  f"expire={expire}"),
         "Profile-Update-Interval": "1",   # hours
         "Cache-Control": "no-store",
     }
@@ -819,14 +903,16 @@ def cmd_sub_serve(a):
         def do_GET(self):
             token = self.path[3:] if self.path.startswith("/s/") else ""
             u = None
+            db = db_load(a.db)
             if len(token) == 32:
-                u = next((x for x in db_load(a.db)["users"] if x["token"] == token), None)
-            if not u or not u["plans"]:
+                u = next((x for x in db["users"] if x.get("token") == token), None)
+            if not u or (not is_volume(db) and not u["plans"]):
                 self.send_error(404); return
             c = {"id": u["uuid"]}
             if flow: c["flow"] = flow
             body, headers = sub_response(u, time.strftime("%Y-%m-%d"),
-                                         [inbound_link(ib, c, a.host, pbk, a.label or a.host)])
+                                         [inbound_link(ib, c, a.host, pbk, a.label or a.host)],
+                                         db)
             self.send_response(200)
             for k, v in headers.items(): self.send_header(k, v)
             self.send_header("Content-Length", str(len(body)))
@@ -884,6 +970,7 @@ def main():
     p.add_argument("--gb", type=float, required=True); p.add_argument("--order")
     sub("sub-disable", cmd_sub_disable, "db", "email")
     sub("sub-list", cmd_sub_list, "db")
+    sub("sub-migrate-v2", cmd_sub_migrate_v2, "db")   # schema-1 -> volume mode
     p = sub("sub-serve", cmd_sub_serve, "db", "config", "inbound")
     p.add_argument("--host", required=True, help="address customers connect to (a domain, not an IP)")
     p.add_argument("--listen", default="127.0.0.1:8480", help="put a TLS reverse proxy in front")
