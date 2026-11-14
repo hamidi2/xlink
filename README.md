@@ -43,13 +43,45 @@ Python 3.8+ and nothing else:
 derived from the private key with `xray x25519`; pass `--pbk` if `xray` is not
 installed on that machine.
 
+## Subscriptions (quota and expiry per customer)
+
+A small JSON database is the source of truth for customers; the inbound's
+client list is derived from it. Each customer keeps one permanent UUID and one
+permanent subscription URL, so renewing never requires a new link.
+
+    xlink sub-setup    config.json --api 127.0.0.1:10085       # once: API + per-user counters
+    xlink sub-user-add users.json alice --days 30 --gb 50 --base-url https://example.com
+    xlink sub-renew    users.json alice --days 30 --gb 50      # new plan, same URL
+    xlink sub-topup    users.json alice --gb 10                # reserve, used after the quota
+    xlink sub-disable  users.json alice
+    xlink sub-list     users.json
+
+    # long-running pieces (run them as services)
+    xlink sub-sync  users.json config.json INBOUND --api 127.0.0.1:10085 --loop
+    xlink sub-serve users.json config.json INBOUND --host example.com   # behind a TLS proxy
+
+- `sub-sync` reads per-user traffic from the Xray API, removes users that ran
+  out of data or time and re-adds renewed ones. Changes go to the running Xray
+  over its API (no restart) and to the config file. It polls: more often when a
+  user is close to the limit, and at once when the database changes. A user can
+  overshoot by what they transfer in one polling interval (15 s minimum).
+- When a user is cut off, their open sockets are closed with `ss -K` (needs
+  root), matched by client IP: other users behind the same IP reconnect.
+- `sub-serve` answers `GET /s/<token>` with the user's link(s) and a
+  `Subscription-Userinfo` header, which v2rayNG/Hiddify show as used/total/expiry.
+  Low-data, expiry and "finished" warnings appear as an extra entry in the
+  server list, so no other notification channel is needed.
+- `--order ID` on add/renew/topup makes the command idempotent, so a payment
+  webhook can safely retry it.
+
 ## Conversion only
 
     xlink decode 'trojan://secret@example.com:443?security=tls&type=ws&path=%2Fws#t1'
     xlink encode outbound.json        # or "-" for stdin
 
 Use `-` as the config path to read from stdin and write to stdout. Restart Xray
-yourself after a change; xlink never restarts services.
+yourself after a change; xlink never restarts services (`sub-sync` applies
+user changes live through the Xray API instead).
 
 ## Tests
 

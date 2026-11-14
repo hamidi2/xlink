@@ -82,5 +82,115 @@ class Inbound(unittest.TestCase):
             xlink.inbound_link(self.IB, c, "203.0.113.7", None, "relay")
 
 
+class Subscriptions(unittest.TestCase):
+    def setUp(self):
+        self.db = {"schema": 1, "users": []}
+        self.u, _ = xlink.db_grant(self.db, "ali", 30, 50, "2026-01-10", create=True, order="o1")
+
+    def test_new_user(self):
+        self.assertEqual(len(self.u["token"]), 32)
+        self.assertEqual(xlink.plan_expiry(self.u["plans"][-1]), "2026-02-09")
+        self.assertEqual(xlink.user_state(self.u, "2026-01-11"), "ok")
+
+    def test_states(self):
+        self.assertEqual(xlink.user_state(self.u, "2026-02-09"), "expired")
+        self.u["used_bytes"] = 50 * xlink.GB
+        self.assertEqual(xlink.user_state(self.u, "2026-01-11"), "over-quota")
+        self.u["used_bytes"] = 0; self.u["active"] = False
+        self.assertEqual(xlink.user_state(self.u, "2026-01-11"), "disabled")
+
+    def test_renew_keeps_identity_and_revives(self):
+        uuid_, token = self.u["uuid"], self.u["token"]
+        self.u["used_bytes"] = 60 * xlink.GB; self.u["active"] = False
+        u, changed = xlink.db_grant(self.db, "ali", 30, 20, "2026-03-01", create=False, order="o2")
+        self.assertTrue(changed)
+        self.assertEqual((u["uuid"], u["token"], u["used_bytes"], u["active"]), (uuid_, token, 0, True))
+        self.assertEqual(len(u["plans"]), 2)
+        self.assertEqual(xlink.user_state(u, "2026-03-02"), "ok")
+
+    def test_same_order_is_a_noop(self):
+        self.u["used_bytes"] = 123
+        u, changed = xlink.db_grant(self.db, "ali", 30, 50, "2026-01-12", create=False, order="o1")
+        self.assertFalse(changed)
+        self.assertEqual((len(u["plans"]), u["used_bytes"]), (1, 123))
+
+    def test_errors(self):
+        for kw in ({"email": "ali", "create": True},        # duplicate
+                   {"email": "nobody", "create": False},     # renew unknown
+                   {"email": "sara", "create": True, "order": "o1"}):  # order reused
+            with self.subTest(kw=kw), self.assertRaises(SystemExit):
+                xlink.db_grant(self.db, kw["email"], 30, 50, "2026-01-12",
+                               create=kw["create"], order=kw.get("order"))
+
+    def test_parse_stats_sums_both_directions(self):
+        text = json.dumps({"stat": [
+            {"name": "user>>>ali>>>traffic>>>uplink", "value": "10"},
+            {"name": "user>>>ali>>>traffic>>>downlink", "value": 5},
+            {"name": "user>>>idle>>>traffic>>>downlink"},
+            {"name": "inbound>>>api>>>traffic>>>downlink", "value": 99}]})
+        self.assertEqual(xlink.parse_stats(text), {"ali": 15, "idle": 0})
+        self.assertEqual(xlink.parse_stats(""), {})
+
+    def test_sync_cuts_off_and_revives(self):
+        other = {"email": "personal", "id": "x"}
+        ib = {"tag": "in", "settings": {"clients": [other]}}
+        added, removed = xlink.sync_clients(ib, self.db, "2026-01-11", "f")
+        self.assertEqual(added, [{"email": "ali", "id": self.u["uuid"], "flow": "f"}])
+        self.assertEqual(xlink.sync_clients(ib, self.db, "2026-01-11", "f"), ([], []))  # stable
+        xlink.apply_usage(self.db, {"ali": 50 * xlink.GB, "stranger": 1})
+        added, removed = xlink.sync_clients(ib, self.db, "2026-01-11", "f")
+        self.assertEqual([c["email"] for c in removed], ["ali"])
+        self.assertEqual(ib["settings"]["clients"], [other])  # unmanaged client untouched
+        xlink.db_grant(self.db, "ali", 30, 50, "2026-01-11", create=False)
+        added, _ = xlink.sync_clients(ib, self.db, "2026-01-11", "")
+        self.assertEqual(added, [{"email": "ali", "id": self.u["uuid"]}])
+
+    def test_interval_shrinks_near_the_limit(self):
+        args = ("2026-01-11", 100, 15, 300)
+        self.assertEqual(xlink.next_interval(self.db, *args), 300)
+        self.u["used_bytes"] = 50 * xlink.GB - 1000 * 1000 * 1000   # 1 GB left -> 80 s at 100 Mbit/s
+        self.assertEqual(xlink.next_interval(self.db, *args), 40)
+        self.u["used_bytes"] = 50 * xlink.GB - 1
+        self.assertEqual(xlink.next_interval(self.db, *args), 15)
+        self.u["used_bytes"] = 50 * xlink.GB
+        self.assertEqual(xlink.next_interval(self.db, *args), 300)   # nobody left to watch
+
+    def test_reserve_is_spent_after_quota_and_survives_renewal(self):
+        xlink.db_topup(self.db, "ali", 10, "2026-01-11", order="t1")
+        _, changed = xlink.db_topup(self.db, "ali", 10, "2026-01-11", order="t1")
+        self.assertFalse(changed)
+        self.u["used_bytes"] = 54 * xlink.GB                      # 4 GB into the reserve
+        self.assertEqual(xlink.user_state(self.u, "2026-01-11"), "ok")
+        self.assertEqual(xlink.reserve_left(self.u), 6 * xlink.GB)
+        self.u["used_bytes"] = 60 * xlink.GB
+        self.assertEqual(xlink.user_state(self.u, "2026-01-11"), "over-quota")
+        self.u["used_bytes"] = 54 * xlink.GB
+        xlink.db_grant(self.db, "ali", 30, 50, "2026-01-20", create=False)
+        self.assertEqual((self.u["used_bytes"], self.u["reserve_bytes"]), (0, 6 * xlink.GB))
+
+    def test_subscription_body_and_notices(self):
+        def lines(today):
+            body, h = xlink.sub_response(self.u, today, ["vless://real"])
+            return base64.b64decode(body).decode().split(), h
+        got, h = lines("2026-01-11")
+        self.assertEqual(got, ["vless://real"])
+        self.assertIn(f"total={50 * xlink.GB}; expire=", h["Subscription-Userinfo"])
+        self.u["used_bytes"] = 46 * xlink.GB                      # under 10% left
+        got, h = lines("2026-01-11")
+        self.assertEqual(len(got), 2); self.assertIn("4.0%20GB%20left", got[0])
+        self.assertIn(f"download={46 * xlink.GB};", h["Subscription-Userinfo"])
+        self.assertEqual(xlink.sub_notices(self.u, "2026-02-07")[-1], "2 day(s) left - renew soon")
+        got, _ = lines("2026-02-09")                              # expired: notice only
+        self.assertEqual(len(got), 1); self.assertIn("EXPIRED", got[0])
+
+    def test_file_round_trip_is_private(self):
+        import os, stat, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "users.json")
+            xlink.db_save(path, self.db)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            self.assertEqual(xlink.db_load(path), self.db)
+
+
 if __name__ == "__main__":
     unittest.main()
