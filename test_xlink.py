@@ -178,11 +178,11 @@ class Subscriptions(unittest.TestCase):
         self.assertIn(f"total={50 * xlink.GB}; expire=", h["Subscription-Userinfo"])
         self.u["used_bytes"] = 46 * xlink.GB                      # under 10% left
         got, h = lines("2026-01-11")
-        self.assertEqual(len(got), 2); self.assertIn("فقط 4.0 گیگ", unquote(got[0]))
+        self.assertEqual(len(got), 2); self.assertIn("Only 4.0 GB", unquote(got[0]))
         self.assertIn(f"download={46 * xlink.GB};", h["Subscription-Userinfo"])
-        self.assertIn("2 روز تا پایان", xlink.sub_notices(self.u, "2026-02-07")[-1])
+        self.assertEqual(xlink.sub_notices(self.u, "2026-02-07")[-1], "2 day(s) left - renew soon")
         got, _ = lines("2026-02-09")                              # expired: notice only
-        self.assertEqual(len(got), 1); self.assertIn("منقضی", unquote(got[0]))
+        self.assertEqual(len(got), 1); self.assertIn("EXPIRED", unquote(got[0]))
 
     def test_file_round_trip_is_private(self):
         import os, stat, tempfile

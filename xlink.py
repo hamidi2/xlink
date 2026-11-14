@@ -779,21 +779,18 @@ def days_left(u, today):
 def sub_notices(u, today, warn_frac=0.1, warn_days=3):
     """Messages the customer should see in the app's server list."""
     state = user_state(u, today)
-    # Customer-facing text is Persian. The RTL mark (U+200F) keeps lines that
-    # start with a digit from rendering left-to-right.
-    rlm = "‏"
-    if state == "expired": return [rlm + "اشتراک منقضی شده - برای اتصال دوباره تمدید کنید"]
-    if state == "over-quota": return [rlm + "حجم این دوره تمام شده - برای اتصال دوباره تمدید کنید"]
-    if state == "disabled": return [rlm + "این اشتراک غیرفعال است"]
+    if state == "expired": return ["EXPIRED - renew to reconnect"]
+    if state == "over-quota": return ["DATA FINISHED - renew to reconnect"]
+    if state == "disabled": return ["DISABLED"]
     out = []
     quota = int(u["plans"][-1]["quota_gb"] * GB)
     left = quota - u["used_bytes"]
     if left <= 0:
-        out.append(rlm + f"حجم دوره تمام شد؛ از اندوخته ({reserve_left(u) / GB:.1f} گیگ) استفاده می‌شود - تمدید کنید")
+        out.append(f"Plan data finished - using reserve: {reserve_left(u) / GB:.1f} GB left - renew")
     elif left <= quota * warn_frac:
-        out.append(rlm + f"فقط {left / GB:.1f} گیگ مانده - به‌زودی تمدید کنید")
+        out.append(f"Only {left / GB:.1f} GB left - renew soon")
     if days_left(u, today) <= warn_days:
-        out.append(rlm + f"{days_left(u, today)} روز تا پایان اشتراک مانده - تمدید کنید")
+        out.append(f"{days_left(u, today)} day(s) left - renew soon")
     return out
 
 
