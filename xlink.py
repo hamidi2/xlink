@@ -725,6 +725,12 @@ def sync_clients(ib, db, today, flow):
     cl = ib["settings"].setdefault("clients", [])
     want = {u["email"]: u for u in db["users"] if user_state(u, today, db) == "ok"}
     known = {u["email"] for u in db["users"]}
+    if is_volume(db):
+        # a device user deleted from the DB (ejected account) must still be
+        # recognized in the inbound so sub-sync can remove it
+        accts = {u.get("account", "") for u in db["users"]}
+        known |= {c.get("email") for c in cl
+                  if c.get("email", "").split("#")[0] in accts}
     removed = [c for c in cl if c.get("email") in known and c["email"] not in want]
     have = {c.get("email") for c in cl}
     added = []
